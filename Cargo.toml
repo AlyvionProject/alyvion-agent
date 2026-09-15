@@ -2,12 +2,31 @@
 name = "alyvion-agent"
 version = "0.1.0"
 edition = "2024"
+description = "Агент Alyvion — сбор телеметрии и событий ИБ на защищаемом узле"
 
 [dependencies]
+# Транспорт до Core: gRPC поверх HTTP/2, один двунаправленный поток.
 tonic = "0.12"
 prost = "0.13"
 tokio = { version = "1", features = ["full"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+
+# Сбор состояния узла: ЦП, память, диски, сеть, процессы.
 sysinfo = "0.32"
+
+# Конфигурация и разбор журналов.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# Время, журналирование, обработка ошибок, идентификаторы событий.
+chrono = "0.4"
+tracing = "0.1"
+# env-filter нужен, чтобы уровень журналирования задавался переменной
+# RUST_LOG без пересборки агента.
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
+uuid = { version = "1", features = ["v4"] }
 
 [build-dependencies]
 tonic-build = "0.12"
