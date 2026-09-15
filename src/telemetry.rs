@@ -6,7 +6,7 @@
 //! оператор всегда видит актуальную картину, а не накопленную историю.
 
 use chrono::Utc;
-use sysinfo::{Disks, Networks, Pid, ProcessesToUpdate, System, Users};
+use sysinfo::{Disks, Networks, Pid, ProcessesToUpdate, System, ThreadKind, Users};
 
 use crate::pb::{ProcessInfo, TelemetryReport};
 
@@ -92,9 +92,21 @@ impl TelemetryCollector {
             net_tx_kb: net_tx / 1024,
 
             uptime_secs: System::uptime() as i64,
-            process_count: self.system.processes().len() as u32,
+            // Считаем только настоящие процессы: sysinfo включает в список
+            // ещё и потоки (см. collect_processes), из-за чего число
+            // процессов на узле было завышено в разы.
+            process_count: self.process_count(),
             processes,
         }
+    }
+
+    /// Число настоящих процессов на узле, без потоков.
+    fn process_count(&self) -> u32 {
+        self.system
+            .processes()
+            .values()
+            .filter(|p| !matches!(p.thread_kind(), Some(ThreadKind::Userland)))
+            .count() as u32
     }
 
     /// Снимок процессов, отсортированный по нагрузке.
@@ -107,6 +119,16 @@ impl TelemetryCollector {
             .system
             .processes()
             .iter()
+            // Отбрасываем ПОТОКИ: sysinfo перечисляет не только процессы, но и
+            // содержимое /proc/<PID>/task/*.
+            //
+            // Поток не является отдельным процессом — он делит адресное
+            // пространство с родителем, поэтому и память, и командная строка
+            // у него родительские. Без этой проверки снимок заполнялся
+            // десятками записей вида «Compositor», «StyleThread#1»,
+            // «WRRende~ckend#1» с памятью браузера, и настоящие процессы
+            // (например, редактор) вытеснялись за предел ограничения.
+            .filter(|(_, process)| !matches!(process.thread_kind(), Some(ThreadKind::Userland)))
             .map(|(pid, process)| {
                 let user = process
                     .user_id()
@@ -184,4 +206,66 @@ mod tests {
         sorted.sort_by(|a, b| b.cmp(a));
         assert_eq!(memory, sorted);
     }
+
+    #[test]
+    fn потоки_не_попадают_в_снимок_процессов() {
+        // Создаём заведомые потоки, чтобы проверка не зависела от того,
+        // есть ли они в системе в момент запуска теста. sysinfo перечисляет
+        // содержимое /proc/<PID>/task/*, поэтому каждый такой поток
+        // появляется в списке отдельной записью с памятью родителя.
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let stop = stop.clone();
+            handles.push(std::thread::spawn(move || {
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+            }));
+        }
+
+        let mut collector = TelemetryCollector::new(10_000);
+        let report = collector.collect();
+
+        let total = collector.system.processes().len();
+        let threads = collector
+            .system
+            .processes()
+            .values()
+            .filter(|p| matches!(p.thread_kind(), Some(sysinfo::ThreadKind::Userland)))
+            .count();
+
+        assert!(
+            threads > 0,
+            "тест не создал ни одного потока — проверка ничего не проверяет"
+        );
+
+        // В снимке процессов потоков быть не должно.
+        assert_eq!(
+            report.processes.len() + threads,
+            total,
+            "в снимок попали потоки: всего {total}, потоков {threads}, в снимке {}",
+            report.processes.len()
+        );
+
+        // Счётчик процессов тоже не должен учитывать потоки.
+        assert_eq!(
+            report.process_count as usize + threads,
+            total,
+            "счётчик процессов учитывает потоки"
+        );
+
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        for h in handles {
+            h.join().ok();
+        }
+    }
+
+    #[test]
+    fn число_процессов_не_превышает_ограничение() {
+        let mut collector = TelemetryCollector::new(50);
+        let report = collector.collect();
+        assert!(report.processes.len() <= 50);
+    }
+
 }

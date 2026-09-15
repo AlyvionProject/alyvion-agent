@@ -15,8 +15,10 @@
 //! без промежуточной оболочки: оболочка не участвует, поэтому
 //! спецсимволы не интерпретируются.
 
+use std::collections::{HashMap, VecDeque};
 use std::net::IpAddr;
 use std::process::Command;
+use std::sync::Mutex;
 use std::time::Instant;
 
 use chrono::Utc;
@@ -53,15 +55,84 @@ impl Outcome {
     }
 }
 
+/// Сколько последних идентификаторов команд помнить для защиты
+/// от повторного выполнения.
+///
+/// Почему не бесконечно: список нужен только чтобы отсечь повторную
+/// доставку той же команды (например, при переподключении канала),
+/// а не для аудита — аудит ведёт Core.
+const EXECUTED_MEMORY: usize = 512;
+
 /// Исполнитель команд реагирования.
 pub struct ResponseExecutor {
     /// Разрешено ли реагирование конфигурацией агента.
     allowed: bool,
+
+    /// Идентификаторы уже выполненных команд.
+    ///
+    /// Зачем. Команда может прийти повторно: например, Core не увидел
+    /// подтверждение и отправил её снова после переподключения канала.
+    /// Без этой проверки действие выполнилось бы дважды, а для
+    /// необратимых действий (изоляция узла, завершение процесса,
+    /// карантин файла) повтор — это уже ошибка реагирования.
+    executed: Mutex<ExecutedCommands>,
+}
+
+/// Исход уже выполненной команды.
+///
+/// Храним именно исход, а не только факт выполнения: при повторной доставке
+/// агент обязан вернуть ТОТ ЖЕ результат. Иначе Core получил бы на успешно
+/// выполненную команду ответ «отклонена» и затёр бы настоящий итог.
+struct ExecutedOutcome {
+    success: bool,
+    message: String,
+}
+
+/// Исходы выполненных команд с ограничением по объёму.
+#[derive(Default)]
+struct ExecutedCommands {
+    outcomes: HashMap<String, ExecutedOutcome>,
+    order: VecDeque<String>,
+}
+
+impl ExecutedCommands {
+    /// Исход, если команда уже выполнялась.
+    fn get(&self, command_id: &str) -> Option<&ExecutedOutcome> {
+        self.outcomes.get(command_id)
+    }
+
+    fn remember(&mut self, command_id: String, success: bool, message: String) {
+        // Первый исход считается окончательным: повторная запись не должна
+        // подменять уже отданный Core результат.
+        if self.outcomes.contains_key(&command_id) {
+            return;
+        }
+
+        self.outcomes.insert(
+            command_id.clone(),
+            ExecutedOutcome {
+                success,
+                message: message.clone(),
+            },
+        );
+
+        self.order.push_back(command_id);
+
+        // Вытесняем самые старые записи, чтобы память не росла.
+        while self.order.len() > EXECUTED_MEMORY {
+            if let Some(oldest) = self.order.pop_front() {
+                self.outcomes.remove(&oldest);
+            }
+        }
+    }
 }
 
 impl ResponseExecutor {
     pub fn new(allowed: bool) -> Self {
-        Self { allowed }
+        Self {
+            allowed,
+            executed: Mutex::new(ExecutedCommands::default()),
+        }
     }
 
     /// Выполняет команду и возвращает результат для Core.
@@ -80,6 +151,49 @@ impl ResponseExecutor {
             issued_by = %command.issued_by,
             "получена команда реагирования"
         );
+
+        // Проверка 0: команда не выполнялась ранее.
+        //
+        // Core может отправить ту же команду повторно (например, не увидев
+        // подтверждение до разрыва канала). Повторное выполнение необратимого
+        // действия — это ошибка реагирования, поэтому команда с известным
+        // идентификатором не выполняется второй раз.
+        {
+            let executed = match self.executed.lock() {
+                Ok(guard) => guard,
+                // Отравленный мьютекс означает панику в другом потоке.
+                // Безопаснее отказать в выполнении, чем рискнуть повтором.
+                Err(_) => {
+                    return self.rejected(
+                        command,
+                        action,
+                        started,
+                        "состояние исполнителя повреждено, команда не выполнена",
+                    );
+                }
+            };
+
+            if let Some(previous) = executed.get(&command.command_id) {
+                tracing::warn!(
+                    command_id = %command.command_id,
+                    action = ?action,
+                    "команда уже выполнялась — повтор не выполняется, возвращается прежний исход"
+                );
+
+                // Возвращаем ровно тот же исход, что и в первый раз: повторная
+                // доставка не должна ни выполнять действие второй раз, ни
+                // искажать уже записанный в Core результат.
+                return ResponseCommandResult {
+                    command_id: command.command_id.clone(),
+                    success: previous.success,
+                    message: previous.message.clone(),
+                    executed_at_unix_ms: Utc::now().timestamp_millis(),
+                    duration_ms: 0,
+                    details: Default::default(),
+                    rejected: false,
+                };
+            }
+        }
 
         // Проверка 1: реагирование вообще разрешено.
         if !self.allowed {
@@ -109,6 +223,16 @@ impl ResponseExecutor {
         };
 
         let duration_ms = started.elapsed().as_millis() as i64;
+
+        // Запоминаем исход, чтобы повторная доставка не выполнила действие
+        // снова и получила тот же самый ответ.
+        if let Ok(mut executed) = self.executed.lock() {
+            executed.remember(
+                command.command_id.clone(),
+                outcome.success,
+                outcome.message.clone(),
+            );
+        }
 
         if outcome.success {
             tracing::info!(
@@ -683,4 +807,86 @@ mod tests {
         assert_eq!(result.command_id, "test-command");
         assert!(result.executed_at_unix_ms > 0);
     }
+
+    #[test]
+    fn повторная_доставка_команды_не_выполняет_действие_снова() {
+        // Проверка должна ЛОВИТЬ повторное выполнение, а не просто сверять
+        // два ответа. Поэтому в память кладётся заведомо «невозможный» исход
+        // с меткой, которую настоящее выполнение вернуть не может: если бы
+        // действие выполнилось повторно, вернулся бы обычный ответ PingAction.
+        let executor = ResponseExecutor::new(true);
+
+        executor
+            .executed
+            .lock()
+            .expect("мьютекс не отравлен")
+            .remember(
+                "повторная-команда".to_string(),
+                false,
+                "МЕТКА-ПОВТОРА".to_string(),
+            );
+
+        let mut cmd = command(ResponseActionType::PingAction);
+        cmd.command_id = "повторная-команда".to_string();
+
+        let result = executor.execute(&cmd);
+
+        assert_eq!(
+            result.message, "МЕТКА-ПОВТОРА",
+            "действие выполнилось повторно: вернулся ответ самого действия, а не прежний исход"
+        );
+        assert!(!result.success, "повтор должен вернуть прежний (неуспешный) исход");
+        assert!(!result.rejected, "повтор — это не отказ, а тот же результат");
+    }
+
+    #[test]
+    fn повтор_неудачной_команды_тоже_не_выполняется_заново() {
+        // Неудачный исход запоминается так же, как успешный: иначе Core
+        // получил бы на повтор ДРУГОЙ ответ, чем в первый раз.
+        let executor = ResponseExecutor::new(true);
+        let mut cmd = command(ResponseActionType::KillProcess);
+        cmd.command_id = "неудачная-команда".to_string();
+
+        let first = executor.execute(&cmd);
+        assert!(!first.success, "без PID команда должна не пройти");
+
+        let second = executor.execute(&cmd);
+        assert_eq!(second.success, first.success);
+        assert_eq!(second.message, first.message);
+    }
+
+    #[test]
+    fn разные_команды_выполняются_независимо() {
+        // Защита не должна мешать разным командам: иначе реагирование
+        // сломается после первой же выдачи.
+        let executor = ResponseExecutor::new(true);
+
+        for id in ["команда-1", "команда-2", "команда-3"] {
+            let mut cmd = command(ResponseActionType::PingAction);
+            cmd.command_id = id.to_string();
+
+            let result = executor.execute(&cmd);
+            assert!(result.success, "команда {id} должна выполниться");
+        }
+    }
+
+    #[test]
+    fn память_о_выполненных_командах_не_растёт_бесконечно() {
+        let mut executed = ExecutedCommands::default();
+
+        for i in 0..EXECUTED_MEMORY + 100 {
+            executed.remember(format!("команда-{i}"), true, "готово".to_string());
+        }
+
+        assert_eq!(
+            executed.outcomes.len(),
+            EXECUTED_MEMORY,
+            "число запомненных команд должно быть ограничено"
+        );
+
+        // Самые старые записи вытеснены, самые свежие — сохранены.
+        assert!(executed.get("команда-0").is_none());
+        assert!(executed.get(&format!("команда-{}", EXECUTED_MEMORY + 99)).is_some());
+    }
+
 }
