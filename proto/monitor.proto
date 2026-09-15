@@ -1,0 +1,26 @@
+syntax = "proto3";
+
+package alyvion;
+
+service EventCollector {
+  rpc SendEvents (EventBatch) returns (EventAck);
+}
+
+message ProcessInfo {
+  uint32 pid = 1;
+  string name = 2;
+  string exe_path = 3;
+  double cpu_usage = 4;
+  uint64 memory_kb = 5;
+}
+
+message EventBatch {
+  string agent_id = 1;
+  string os = 2;
+  repeated ProcessInfo processes = 3;
+}
+
+message EventAck {
+  bool success = 1;
+  string message = 2;
+}
