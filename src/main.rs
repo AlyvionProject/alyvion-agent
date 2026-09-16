@@ -24,7 +24,7 @@ mod telemetry;
 use std::time::Duration;
 
 use anyhow::Context;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::{Channel, Endpoint};
 use tonic::Request;
@@ -47,6 +47,105 @@ use pb::{
 
 /// Версия агента — уходит в Core и отображается в консоли.
 const AGENT_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Интервалы работы, которые можно изменить на ходу.
+///
+/// ЗАЧЕМ ОТДЕЛЬНАЯ СТРУКТУРА. Раньше агент объявлял свои интервалы в
+/// журнале при регистрации и на этом останавливался: значения из ответа
+/// Core (`telemetry_interval_secs`, `heartbeat_interval_secs`) никуда
+/// не применялись, а тикеры создавались ДО получения ответа — то есть
+/// из локального конфигурационного файла. Оператор менял интервал
+/// в Core и не видел никакого эффекта.
+///
+/// ПОЧЕМУ watch, А НЕ АТОМИКИ. Первая версия хранила значения в AtomicU64,
+/// и цикл замечал смену только после очередного тика. Если локальный
+/// интервал был большим (например, 99 секунд), первый тик ждал все 99
+/// секунд, и присланное Core значение применялось лишь после этого —
+/// то есть исправление не работало как раз в самом заметном случае.
+/// watch-канал будит ожидающий цикл сразу, как только пришло новое
+/// значение, поэтому смена интервала действует без задержки.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Intervals {
+    telemetry_secs: u64,
+    heartbeat_secs: u64,
+}
+
+impl Intervals {
+    fn new(telemetry_secs: u64, heartbeat_secs: u64) -> Self {
+        Self {
+            // Нижняя граница — не прихоть: при интервале 0 тикер срабатывает
+            // непрерывно и загружает узел и канал связи вхолостую.
+            telemetry_secs: telemetry_secs.max(1),
+            heartbeat_secs: heartbeat_secs.max(1),
+        }
+    }
+
+    fn telemetry(&self) -> Duration {
+        Duration::from_secs(self.telemetry_secs)
+    }
+
+    fn heartbeat(&self) -> Duration {
+        Duration::from_secs(self.heartbeat_secs)
+    }
+
+    /// Применяет интервалы, присланные Core при регистрации.
+    ///
+    /// Нулевые значения игнорируются: так агент переживает Core, который
+    /// не заполнил поля, — вместо мгновенного цикла остаются прежние
+    /// интервалы.
+    fn apply(&self, telemetry_secs: u64, heartbeat_secs: u64) -> Self {
+        Self {
+            telemetry_secs: if telemetry_secs > 0 {
+                telemetry_secs.max(1)
+            } else {
+                self.telemetry_secs
+            },
+            heartbeat_secs: if heartbeat_secs > 0 {
+                heartbeat_secs.max(1)
+            } else {
+                self.heartbeat_secs
+            },
+        }
+    }
+}
+
+/// Ждёт очередного срока, прерываясь при смене интервала.
+///
+/// Возвращает актуальный интервал. Ожидание прерывается, если пришло
+/// новое значение, — поэтому смена настройки в Core применяется сразу,
+/// а не после отработки прежнего, возможно очень длинного, интервала.
+async fn wait_period(
+    rx: &mut tokio::sync::watch::Receiver<Intervals>,
+    current: Intervals,
+    telemetry: bool,
+) -> Intervals {
+    let period = if telemetry {
+        current.telemetry()
+    } else {
+        current.heartbeat()
+    };
+
+    tokio::select! {
+        _ = tokio::time::sleep(period) => current,
+        changed = rx.changed() => {
+            // Ошибка означает, что отправитель закрыт — значит, агент
+            // завершается. Возвращаем прежнее значение, цикл проверит
+            // канал отправки и выйдет сам.
+            match changed {
+                Ok(()) => {
+                    let updated = *rx.borrow_and_update();
+                    tracing::info!(
+                        telemetry_secs = updated.telemetry_secs,
+                        heartbeat_secs = updated.heartbeat_secs,
+                        "интервалы изменены Core"
+                    );
+                    updated
+                }
+                Err(_) => current,
+            }
+        }
+    }
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -161,10 +260,29 @@ async fn run_session(config: &AgentConfig) -> anyhow::Result<()> {
 
     tracing::info!("двунаправленный поток открыт");
 
+    // Интервалы из локального файла — стартовые. Как только придёт ответ
+    // Core, они будут заменены на присланные сервером: настройка задаётся
+    // на стороне Core, а не на каждом узле отдельно.
+    //
+    // watch-канал, а не общая переменная: он не только хранит значение,
+    // но и будит ожидающий цикл, поэтому новый интервал вступает в силу
+    // немедленно, а не после отработки прежнего.
+    let (intervals_tx, intervals_rx) = watch::channel(Intervals::new(
+        config.telemetry_interval_secs,
+        config.heartbeat_interval_secs,
+    ));
+
     // Периодические задачи агента. Каждая пишет в общий канал,
     // поэтому порядок сообщений в потоке сохраняется.
-    let telemetry_task = tokio::spawn(telemetry_loop(config.clone(), out_tx.clone()));
-    let heartbeat_task = tokio::spawn(heartbeat_loop(config.clone(), out_tx.clone()));
+    let telemetry_task = tokio::spawn(telemetry_loop(
+        config.clone(),
+        intervals_rx.clone(),
+        out_tx.clone(),
+    ));
+    let heartbeat_task = tokio::spawn(heartbeat_loop(
+        intervals_rx.clone(),
+        out_tx.clone(),
+    ));
 
     // Сбор событий идёт в отдельной задаче с блокирующими вызовами
     // (чтение файлов, запуск journalctl), поэтому вынесен в spawn_blocking
@@ -178,7 +296,9 @@ async fn run_session(config: &AgentConfig) -> anyhow::Result<()> {
     let inbound_result = loop {
         match inbound.message().await {
             Ok(Some(message)) => {
-                if let Err(err) = handle_core_message(message, &out_tx, &executor).await {
+                if let Err(err) =
+                    handle_core_message(message, &out_tx, &executor, &intervals_tx).await
+                {
                     tracing::warn!(error = %err, "ошибка обработки сообщения Core");
                 }
             }
@@ -237,16 +357,23 @@ async fn send_hello(tx: &mpsc::Sender<AgentMessage>, config: &AgentConfig) -> an
 }
 
 /// Периодическая отправка телеметрии.
-async fn telemetry_loop(config: AgentConfig, tx: mpsc::Sender<AgentMessage>) {
+///
+/// Интервал берётся из `Intervals` на каждой итерации, а не один раз при
+/// создании тикера: Core может изменить его уже после подключения узла.
+async fn telemetry_loop(
+    config: AgentConfig,
+    mut rx: tokio::sync::watch::Receiver<Intervals>,
+    tx: mpsc::Sender<AgentMessage>,
+) {
     let mut collector = TelemetryCollector::new(config.max_processes);
-    let mut ticker = tokio::time::interval(config.telemetry_interval());
+    let mut current = *rx.borrow_and_update();
 
-    // Первый тик interval срабатывает сразу — для корректного расчёта
-    // загрузки ЦП нужен интервал между замерами, поэтому пропускаем его.
-    ticker.tick().await;
+    // Первое ожидание тоже прерываемое. Обычный sleep здесь был ошибкой:
+    // он задерживал старт на локальный интервал (в проверке — 99 секунд),
+    // поэтому присланное Core значение не применялось до его истечения.
+    current = wait_period(&mut rx, current, true).await;
 
     loop {
-        ticker.tick().await;
 
         // Сбор телеметрии — синхронная работа с /proc: уводим её
         // с реактора, чтобы не задерживать обработку команд Core.
@@ -270,16 +397,22 @@ async fn telemetry_loop(config: AgentConfig, tx: mpsc::Sender<AgentMessage>) {
             tracing::debug!("канал закрыт, отправка телеметрии остановлена");
             return;
         }
+
+        // Ждём следующего срока; при смене интервала ожидание прерывается.
+        current = wait_period(&mut rx, current, true).await;
     }
 }
 
 /// Периодическая отправка heartbeat.
-async fn heartbeat_loop(config: AgentConfig, tx: mpsc::Sender<AgentMessage>) {
-    let mut ticker = tokio::time::interval(config.heartbeat_interval());
-    ticker.tick().await;
+async fn heartbeat_loop(
+    mut rx: tokio::sync::watch::Receiver<Intervals>,
+    tx: mpsc::Sender<AgentMessage>,
+) {
+    let mut current = *rx.borrow_and_update();
+    // Первое ожидание прерываемое — по той же причине, что и у телеметрии.
+    current = wait_period(&mut rx, current, false).await;
 
     loop {
-        ticker.tick().await;
 
         let heartbeat = AgentHeartbeat {
             timestamp_unix_ms: chrono::Utc::now().timestamp_millis(),
@@ -296,6 +429,8 @@ async fn heartbeat_loop(config: AgentConfig, tx: mpsc::Sender<AgentMessage>) {
         {
             return;
         }
+
+        current = wait_period(&mut rx, current, false).await;
     }
 }
 
@@ -367,10 +502,26 @@ async fn handle_core_message(
     message: CoreMessage,
     tx: &mpsc::Sender<AgentMessage>,
     executor: &std::sync::Arc<ResponseExecutor>,
+    intervals: &watch::Sender<Intervals>,
 ) -> anyhow::Result<()> {
     match message.payload {
         Some(core_message::Payload::HelloAck(ack)) => {
             if ack.accepted {
+                // Интервалы, присланные Core, применяются к уже работающим
+                // циклам. Раньше они только попадали в журнал, и настройка
+                // Core ни на что не влияла.
+                //
+                // Приведение через max(0): в proto поле объявлено uint32,
+                // но Rust-стаб отдаёт i32, поэтому отрицательное значение
+                // теоретически возможно — его нужно отсечь, а не паниковать.
+                // send_replace, а не send: он не падает, если приёмников
+                // ещё нет, и всегда записывает новое значение.
+                let updated = intervals.borrow().apply(
+                    ack.telemetry_interval_secs.max(0) as u64,
+                    ack.heartbeat_interval_secs.max(0) as u64,
+                );
+                intervals.send_replace(updated);
+
                 tracing::info!(
                     server_version = %ack.server_version,
                     telemetry_interval = ack.telemetry_interval_secs,

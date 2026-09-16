@@ -194,14 +194,6 @@ impl AgentConfig {
         Ok(())
     }
 
-    pub fn telemetry_interval(&self) -> Duration {
-        Duration::from_secs(self.telemetry_interval_secs)
-    }
-
-    pub fn heartbeat_interval(&self) -> Duration {
-        Duration::from_secs(self.heartbeat_interval_secs)
-    }
-
     pub fn events_interval(&self) -> Duration {
         Duration::from_secs(self.events_interval_secs)
     }
