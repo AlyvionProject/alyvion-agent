@@ -440,9 +440,9 @@ def main() -> int:
     say("  2. Смена контракта не ловится компилятором на стороне Python:")
     say("     стабы нужно перегенерировать, иначе прототип останется")
     say("     на старой версии протокола.")
-    say("         cd alyvion-core/alyvion-py && .venv/bin/python scripts/gen_proto.py")
+    say("         cd alyvion-core && .venv/bin/python scripts/gen_proto.py")
     say()
-    say("  3. Пересобрать потребителя: .NET-ядро или Rust-агент.")
+    say("  3. Пересобрать агент: Rust-агент (cargo build).")
     return 0
 
 
