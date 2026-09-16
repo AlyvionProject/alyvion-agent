@@ -1,6 +1,0 @@
-# Каталог target держим внутри проекта, чтобы не зависеть от состояния /home.
-[build]
-target-dir = "target"
-
-[net]
-offline = true

@@ -1,8 +1,9 @@
 //! Компиляция контракта Agent <-> Core.
 //!
-//! Proto-файл НЕ дублируется в агенте: берётся общий из репозитория
-//! (`proto/alyvion.proto`) — тот же самый, что компилирует Core.
-//! Это гарантирует, что обе стороны всегда говорят на одном языке.
+//! Контракт НЕ дублируется в агенте: он лежит в отдельном репозитории
+//! alyvion-shared, подключённом git-сабмодулем. Путь ОДИН и строго
+//! фиксирован: external/alyvion-shared/proto/alyvion.proto.
+//!
 
 use std::path::PathBuf;
 
@@ -15,15 +16,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let manifest_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR")?);
-    let repo_root = manifest_dir
-        .parent()
-        .ok_or("не удалось определить корень репозитория")?;
-
-    let proto_dir = repo_root.join("proto");
+    let proto_dir = manifest_dir
+        .join("external")
+        .join("alyvion-shared")
+        .join("proto");
     let proto_file = proto_dir.join("alyvion.proto");
 
     if !proto_file.exists() {
-        return Err(format!("не найден общий proto-файл: {}", proto_file.display()).into());
+        return Err(format!(
+            "не найден контракт: {}\n\
+             Он лежит в репозитории alyvion-shared, подключённом сабмодулем.\n\
+             Скорее всего сабмодуль не склонирован. Выполните в корне репозитория:\n\
+             \n    python RUN_THIS.py\n\
+             \n\
+             Он склонирует сабмодуль и поставит нужную ревизию контракта.\n\
+             Эквивалент вручную (ставит коммит ИЗ ИНДЕКСА репозитория):\n\
+             \n    git submodule update --init --recursive",
+            proto_file.display()
+        )
+        .into());
     }
 
     println!("cargo:rerun-if-changed={}", proto_file.display());
