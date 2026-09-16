@@ -1,0 +1,3 @@
+[submodule "external/alyvion-shared"]
+	path = external/alyvion-shared
+	url = git@github.com:AlyvionProject/alyvion-shared.git
