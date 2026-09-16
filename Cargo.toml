@@ -27,6 +27,30 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"
 uuid = { version = "1", features = ["v4"] }
+quick-xml = "0.42.0"
+encoding_rs = "0.8.41"
+
+# ---------------------------------------------------------------------------
+#  Зависимости только для Windows.
+#
+#  Вынесены в отдельную секцию target.'cfg(windows)', а не в общий список:
+#  крейт windows при обычном подключении ломает сборку под Linux (его
+#  модуль windows-future не компилируется вне Windows). Платформенная
+#  секция гарантирует, что Linux-агент вообще не тянет эти зависимости.
+# ---------------------------------------------------------------------------
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_System_EventLog",
+    # GetOEMCP: определяет кодировку вывода консольных программ
+    # (cp866 на русской Windows) — без неё русский текст в отчётах
+    # реагирования превращался бы в мусор.
+    "Win32_Globalization",
+    # CREATE_NO_WINDOW: не показывать окно консоли при вызове
+    # taskkill, netsh и других утилит из агента-службы.
+    "Win32_System_Threading",
+    "Win32_Security",
+] }
 
 [build-dependencies]
 tonic-build = "0.12"

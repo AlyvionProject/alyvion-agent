@@ -52,6 +52,26 @@ struct CollectorState {
     /// отдельно от числовых смещений файлов.
     #[serde(default)]
     cursors: HashMap<String, String>,
+
+    /// Закладки журнала Windows по каналам.
+    ///
+    /// В журнале Windows нет смещений в строках, как у текстовых файлов
+    /// Linux: позицию чтения задаёт ЗАКЛАДКА — XML-строка, указывающая
+    /// на конкретную запись. Хранится отдельно от курсоров journald,
+    /// потому что это значение другого происхождения.
+    #[serde(default)]
+    windows_bookmarks: HashMap<String, String>,
+
+    /// Проблемы каналов Windows, о которых уже сообщено.
+    ///
+    /// ЗАЧЕМ. Нехватка прав или отсутствие канала — состояние УСТОЙЧИВОЕ:
+    /// оно не меняется от прохода к проходу. Если сообщать о нём каждый
+    /// раз, одна и та же строка писалась бы каждые несколько секунд годами
+    /// (проверено на живой ВМ: пять строк каждые 10 секунд — это около
+    /// 43 000 записей в сутки), а настоящая новая проблема потерялась бы
+    /// в этом шуме. Поэтому сообщается только о ПОЯВЛЕНИИ и УСТРАНЕНИИ.
+    #[serde(default)]
+    windows_problems: Vec<String>,
 }
 
 /// Состояние сборщиков и разобранные события.
@@ -69,6 +89,22 @@ impl EventCollector {
             state,
             tail_lines,
         }
+    }
+
+    /// Переносит закладки Windows в общее состояние и обратно.
+    ///
+    /// Закладки живут в том же файле состояния, что и смещения текстовых
+    /// журналов: отдельный файл пришлось бы синхронизировать, а при
+    /// расхождении агент читал бы журнал повторно либо пропускал записи.
+    fn windows_state(&self) -> crate::winlog::WindowsLogState {
+        crate::winlog::WindowsLogState {
+            bookmarks: self.state.windows_bookmarks.clone(),
+        }
+    }
+
+    /// Сохраняет обновлённые закладки Windows.
+    fn store_windows_state(&mut self, state: crate::winlog::WindowsLogState) {
+        self.state.windows_bookmarks = state.bookmarks;
     }
 
     fn state_file(state_dir: &Path) -> PathBuf {
@@ -159,7 +195,50 @@ impl EventCollector {
 
         events.extend(self.collect_extra_paths(&extra_paths));
 
+        // Журнал событий Windows. На Linux эта ветка возвращает пустой
+        // список, поэтому вызов безопасен на любой платформе.
+        if toggles.winevent {
+            events.extend(self.collect_windows_events(toggles.sysmon));
+        }
+
         self.save_state();
+        events
+    }
+
+    /// Читает новые записи журнала событий Windows.
+    ///
+    /// Проблемы с отдельными каналами (нет прав, канал отсутствует)
+    /// не прерывают сбор: они записываются в журнал агента, а остальные
+    /// каналы читаются дальше. Иначе отсутствие прав на канал Security
+    /// лишило бы оператора вообще всех событий, включая системные.
+    fn collect_windows_events(&mut self, include_sysmon: bool) -> Vec<SecurityEvent> {
+        let mut state = self.windows_state();
+        // Ограничение первого прохода берётся из той же настройки, что и
+        // для текстовых журналов Linux: логика должна совпадать, иначе
+        // первый запуск на узле с большим журналом дал бы лавину событий.
+        let (events, problems) =
+            crate::winlog::collect(&mut state, include_sysmon, self.tail_lines);
+        self.store_windows_state(state);
+
+        // Сообщается только об ИЗМЕНЕНИЯХ состояния каналов.
+        let previous = std::mem::take(&mut self.state.windows_problems);
+
+        for problem in &problems {
+            if !previous.contains(problem) {
+                tracing::warn!(problem = %problem, "журнал Windows");
+            }
+        }
+
+        // Канал, который раньше не читался, снова читается: об этом стоит
+        // сказать, иначе оператор будет считать, что проблема осталась.
+        for old_problem in &previous {
+            if !problems.contains(old_problem) {
+                tracing::info!(was = %old_problem, "журнал Windows: чтение канала восстановлено");
+            }
+        }
+
+        self.state.windows_problems = problems;
+
         events
     }
 

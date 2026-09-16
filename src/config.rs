@@ -79,6 +79,57 @@ pub struct CollectorToggles {
     pub auditd: bool,
     /// События уровня агента: запуск, подключение, реагирование.
     pub agent: bool,
+
+    /// Журнал событий Windows (Security, System, Application,
+    /// PowerShell). На Linux настройка не действует: журнала Windows
+    /// там нет, и сборщик возвращает пустой список.
+    pub winevent: bool,
+
+    /// Канал Sysmon.
+    ///
+    /// Выключен по умолчанию: Sysmon — отдельный продукт, который надо
+    /// устанавливать самостоятельно. Если опрашивать его канал на машине
+    /// без Sysmon, агент на каждом цикле получал бы ошибку «канал
+    /// не найден» и засорял журнал. Включается, только когда Sysmon
+    /// действительно установлен.
+    pub sysmon: bool,
+}
+
+impl CollectorToggles {
+    /// Настройки по умолчанию с учётом платформы.
+    ///
+    /// ПОЧЕМУ ПО ПЛАТФОРМЕ. Сборщики Linux и Windows не пересекаются:
+    /// на Windows бессмысленны journald, auth.log и auditd (их нет),
+    /// а на Linux нет журнала событий Windows. Если включить всё сразу,
+    /// агент на каждой платформе половину времени тратил бы на попытки
+    /// обратиться к несуществующим источникам.
+    pub fn for_current_platform() -> Self {
+        if cfg!(windows) {
+            Self {
+                journald: false,
+                auth_log: false,
+                auditd: false,
+                agent: true,
+                winevent: true,
+                sysmon: false,
+            }
+        } else {
+            Self {
+                journald: true,
+                auth_log: true,
+                auditd: true,
+                agent: true,
+                winevent: false,
+                sysmon: false,
+            }
+        }
+    }
+}
+
+impl Default for CollectorToggles {
+    fn default() -> Self {
+        Self::for_current_platform()
+    }
 }
 
 impl Default for AgentConfig {
@@ -96,17 +147,6 @@ impl Default for AgentConfig {
             allow_response_actions: false,
             collectors: CollectorToggles::default(),
             extra_log_paths: Vec::new(),
-        }
-    }
-}
-
-impl Default for CollectorToggles {
-    fn default() -> Self {
-        Self {
-            journald: true,
-            auth_log: true,
-            auditd: true,
-            agent: true,
         }
     }
 }
@@ -206,6 +246,18 @@ impl AgentConfig {
     ///
     /// Если реагирование выключено, список пуст — Core это увидит
     /// и не будет присылать команды, которые всё равно будут отклонены.
+    /// Возможности реагирования, объявляемые Core.
+    ///
+    /// Все перечисленные действия реализованы И НА LINUX, И НА WINDOWS:
+    /// на Linux через `iptables`, `kill` и `usermod`, на Windows через
+    /// `netsh advfirewall`, `taskkill` и `net user`. Поэтому список
+    /// не зависит от платформы — общий набор соответствует реальным
+    /// возможностям агента на любой из них.
+    ///
+    /// ВАЖНО: список объявляется, только если реагирование разрешено
+    /// конфигурацией. Панель Core показывает по нему доступные кнопки,
+    /// поэтому объявление невыполнимого действия было бы обманом
+    /// оператора.
     pub fn declared_capabilities(&self) -> Vec<i32> {
         if !self.allow_response_actions {
             return Vec::new();
@@ -230,8 +282,14 @@ impl AgentConfig {
     }
 
     /// Имена активных источников событий — уходят в Core для отображения.
+    ///
+    /// Словарь имён согласован с описанием поля `source` в контракте:
+    /// `journald | auth.log | auditd | wineventlog | sysmon | agent`.
+    /// Core показывает эти имена оператору, поэтому они должны совпадать
+    /// с тем, что агент действительно собирает.
     pub fn active_collectors(&self) -> Vec<String> {
         let mut list = Vec::new();
+
         if self.collectors.journald {
             list.push("journald".to_string());
         }
@@ -241,9 +299,16 @@ impl AgentConfig {
         if self.collectors.auditd {
             list.push("auditd".to_string());
         }
+        if self.collectors.winevent {
+            list.push("wineventlog".to_string());
+        }
+        if self.collectors.sysmon {
+            list.push("sysmon".to_string());
+        }
         if self.collectors.agent {
             list.push("agent".to_string());
         }
+
         list
     }
 }

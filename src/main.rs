@@ -20,6 +20,21 @@ mod config;
 mod events;
 mod response;
 mod telemetry;
+// Разбор журнала Windows. Не зависит от Windows: только преобразование
+// XML в единую схему события, поэтому тестируется на любой платформе.
+mod winevent;
+// Чтение журнала Windows: под Windows использует Windows API,
+// на прочих платформах — заглушка, возвращающая пустой список.
+mod winlog;
+// Декодирование вывода консольных программ Windows (CP866/CP1251):
+// без него русский текст в отчётах реагирования превращался бы в мусор.
+mod console;
+// Выполнение команд Windows: подавление окна консоли и
+// декодирование вывода в кодовой странице OEM.
+mod sysops;
+// Составление команд Windows (netsh, taskkill, net user) без
+// зависимости от платформы — ради проверяемости тестами.
+mod wincmd;
 
 use std::time::Duration;
 
@@ -591,20 +606,61 @@ fn init_tracing() {
 }
 
 /// Описание операционной системы из `/etc/os-release`.
+/// Определяет название операционной системы.
+///
+/// ПОЧЕМУ ЧЕРЕЗ `sysinfo`, А НЕ ЧЕРЕЗ `/etc/os-release`. Прежняя версия
+/// читала файл `/etc/os-release`, которого в Windows НЕТ. На Windows она
+/// всегда возвращала безликое «windows» вместо, например, «Windows 10 Pro»,
+/// и оператор не мог отличить редакцию. `sysinfo` умеет определять
+/// название на всех поддерживаемых платформах.
+///
+/// Чтение `/etc/os-release` сохранено как уточнение для Linux: там оно
+/// даёт более точное описание (например, «Fedora Linux 42»), чем
+/// обобщённое имя от `sysinfo`.
 fn os_version() -> String {
-    std::fs::read_to_string("/etc/os-release")
-        .ok()
-        .and_then(|text| {
-            text.lines()
-                .find_map(|l| l.strip_prefix("PRETTY_NAME=").map(|v| v.trim_matches('"').to_string()))
-        })
+    // На Linux предпочитаем точное название из файла выпуска.
+    #[cfg(not(windows))]
+    if let Some(pretty) = read_linux_pretty_name() {
+        return pretty;
+    }
+
+    sysinfo::System::long_os_version()
+        .or_else(|| sysinfo::System::name())
+        .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| std::env::consts::OS.to_string())
 }
 
-/// Версия ядра.
+/// Читает поле `PRETTY_NAME` из `/etc/os-release`.
+///
+/// Возвращает `None`, если файла нет или поле отсутствует.
+#[cfg(not(windows))]
+fn read_linux_pretty_name() -> Option<String> {
+    parse_pretty_name(&std::fs::read_to_string("/etc/os-release").ok()?)
+}
+
+/// Разбирает `PRETTY_NAME` из содержимого файла выпуска.
+///
+/// Вынесено отдельно от чтения файла, чтобы разбор можно было проверить
+/// тестами: сама логика (кавычки, пробелы, отсутствие поля) — источник
+/// ошибок, а не обращение к файловой системе.
+#[cfg(not(windows))]
+fn parse_pretty_name(content: &str) -> Option<String> {
+    content.lines().find_map(|line| {
+        line.strip_prefix("PRETTY_NAME=")
+            .map(|value| value.trim().trim_matches('"').trim().to_string())
+            .filter(|value| !value.is_empty())
+    })
+}
+
+/// Версия ядра операционной системы.
+///
+/// Прежняя версия читала `/proc/sys/kernel/osrelease` — файла с таким
+/// путём в Windows не существует, поэтому на Windows версия ядра всегда
+/// была пустой. `sysinfo` возвращает её на всех платформах: на Windows
+/// это версия ядра NT, что и требуется для инвентаризации.
 fn kernel_version() -> String {
-    std::fs::read_to_string("/proc/sys/kernel/osrelease")
-        .map(|s| s.trim().to_string())
+    sysinfo::System::kernel_version()
+        .filter(|s| !s.trim().is_empty())
         .unwrap_or_default()
 }
 
@@ -648,5 +704,68 @@ pub fn agent_event(action: &str, message: String) -> pb::SecurityEvent {
         outcome: "success".to_string(),
         message,
         ..Default::default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// Проверяет разбор файла выпуска Linux. Разбор вынесен в отдельную
+    /// функцию именно ради этой проверки: ошибки в кавычках и пробелах
+    /// заметны только на конкретных примерах.
+    #[cfg(not(windows))]
+    #[test]
+    fn название_системы_извлекается_из_os_release() {
+        let content = "NAME=Fedora\nPRETTY_NAME=\"Fedora Linux 42 (Workstation)\"\nID=fedora\n";
+        assert_eq!(
+            super::parse_pretty_name(content).as_deref(),
+            Some("Fedora Linux 42 (Workstation)")
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn название_системы_без_кавычек_тоже_читается() {
+        let content = "PRETTY_NAME=Debian GNU/Linux 12\n";
+        assert_eq!(
+            super::parse_pretty_name(content).as_deref(),
+            Some("Debian GNU/Linux 12")
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn отсутствие_поля_не_паникует() {
+        // Файл без PRETTY_NAME — не ошибка: вызывающий код перейдёт
+        // к определению через sysinfo.
+        assert_eq!(super::parse_pretty_name("NAME=Fedora\nID=fedora\n"), None);
+        assert_eq!(super::parse_pretty_name(""), None);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn пустое_значение_считается_отсутствующим() {
+        // Пустое PRETTY_NAME не должно подменять настоящее название
+        // системы пустой строкой в карточке узла.
+        assert_eq!(super::parse_pretty_name("PRETTY_NAME=\"\"\n"), None);
+        assert_eq!(super::parse_pretty_name("PRETTY_NAME=\n"), None);
+    }
+
+    /// Определение системы работает на этой платформе и не возвращает
+    /// пустую строку: иначе в карточке узла был бы прочерк.
+    #[test]
+    fn определение_системы_даёт_непустой_результат() {
+        let name = super::os_version();
+        assert!(!name.trim().is_empty(), "название системы не должно быть пустым");
+    }
+
+    /// Версия ядра определяется на обеих платформах. Именно эта функция
+    /// раньше читала /proc, которого нет в Windows.
+    #[test]
+    fn версия_ядра_определяется() {
+        let version = super::kernel_version();
+        assert!(
+            !version.trim().is_empty(),
+            "версия ядра не должна быть пустой"
+        );
     }
 }

@@ -24,6 +24,8 @@ use std::time::Instant;
 use chrono::Utc;
 
 use crate::pb::{ResponseActionType, ResponseCommand, ResponseCommandResult};
+use crate::wincmd;
+use crate::sysops;
 
 /// Результат выполнения: успех, сообщение и дополнительные сведения.
 struct Outcome {
@@ -76,6 +78,14 @@ pub struct ResponseExecutor {
     /// необратимых действий (изоляция узла, завершение процесса,
     /// карантин файла) повтор — это уже ошибка реагирования.
     executed: Mutex<ExecutedCommands>,
+
+    /// Кодовая страница консоли, определённая при первом запуске команды.
+    ///
+    /// Вынесена в поле, потому что её определение — системный вызов,
+    /// а значение неизменно в течение сеанса. `OnceLock` избавляет
+    /// от повторных обращений и от необходимости передавать значение
+    /// через все обработчики.
+    code_page: std::sync::OnceLock<u32>,
 }
 
 /// Исход уже выполненной команды.
@@ -132,6 +142,7 @@ impl ResponseExecutor {
         Self {
             allowed,
             executed: Mutex::new(ExecutedCommands::default()),
+            code_page: std::sync::OnceLock::new(),
         }
     }
 
@@ -261,6 +272,34 @@ impl ResponseExecutor {
         }
     }
 
+    /// Выполняет команду Windows и переводит её итог в `Outcome`.
+    ///
+    /// Возвращает `Ok(())` при успехе и `Err(Outcome)` с описанием отказа
+    /// иначе. Такой вид позволяет вызывающему коду добавить к успеху свои
+    /// подробности, а отказ отдать как есть.
+    ///
+    /// Кодовая страница консоли определяется один раз при первом вызове
+    /// и запоминается: системный вызов на каждую команду был бы лишним,
+    /// а значение в рамках сеанса не меняется.
+    fn run_windows(&self, spec: &wincmd::CommandSpec) -> Result<(), Outcome> {
+        let code_page = *self
+            .code_page
+            .get_or_init(crate::sysops::console_code_page);
+
+        let result = sysops::execute(spec, code_page);
+
+        // Команда записывается в журнал агента: администратор должен
+        // видеть, что именно выполнил агент на узле.
+        tracing::info!(command = %spec.display(), success = result.success, "команда Windows");
+
+        if result.success {
+            Ok(())
+        } else {
+            Err(Outcome::fail(result.failure_message(spec))
+                .with("command", spec.display()))
+        }
+    }
+
     /// Формирует отчёт об отклонённой команде.
     fn rejected(
         &self,
@@ -298,6 +337,16 @@ impl ResponseExecutor {
             Err(err) => return Outcome::fail(err),
         };
 
+        if cfg!(windows) {
+            return match self.run_windows(&wincmd::block_ip(&ip)) {
+                Ok(()) => Outcome::ok(format!("Адрес {ip} заблокирован на узле"))
+                    .with("ip", ip.clone())
+                    .with("direction", "in")
+                    .with("mechanism", "netsh advfirewall"),
+                Err(outcome) => outcome,
+            };
+        }
+
         // Правило в отдельной цепочке: её легко снять целиком и она
         // не мешает штатным правилам администратора.
         let added = run("iptables", &["-I", "INPUT", "-s", &ip, "-j", "DROP"]);
@@ -327,6 +376,15 @@ impl ResponseExecutor {
             Err(err) => return Outcome::fail(err),
         };
 
+        if cfg!(windows) {
+            return match self.run_windows(&wincmd::unblock_ip(&ip)) {
+                Ok(()) => Outcome::ok(format!("Блокировка адреса {ip} снята"))
+                    .with("ip", ip.clone())
+                    .with("mechanism", "netsh advfirewall"),
+                Err(outcome) => outcome,
+            };
+        }
+
         // Удаляем все правила для этого адреса: их могло накопиться несколько.
         for _ in 0..16 {
             let removed = run("iptables", &["-D", "INPUT", "-s", &ip, "-j", "DROP"]);
@@ -347,6 +405,20 @@ impl ResponseExecutor {
     /// с сохранением уже установленных соединений (в том числе канала
     /// управления). Полная изоляция узла в прототипе не применяется.
     fn isolate_host(&self, _command: &ResponseCommand) -> Outcome {
+        if cfg!(windows) {
+            return match self.run_windows(&wincmd::isolate_host()) {
+                // Тот же безопасный режим, что и на Linux: блокируются
+                // только НОВЫЕ входящие соединения, поэтому канал
+                // с Core сохраняется и узел остаётся управляемым.
+                Ok(()) => Outcome::ok(
+                    "Новые входящие соединения заблокированы; канал с Core сохранён",
+                )
+                .with("mode", "new-connections-only")
+                .with("mechanism", "netsh advfirewall"),
+                Err(outcome) => outcome,
+            };
+        }
+
         let result = run(
             "iptables",
             &[
@@ -372,6 +444,13 @@ impl ResponseExecutor {
 
     /// Снятие изоляции узла.
     fn release_host(&self, _command: &ResponseCommand) -> Outcome {
+        if cfg!(windows) {
+            return match self.run_windows(&wincmd::release_host()) {
+                Ok(()) => Outcome::ok("Изоляция узла снята"),
+                Err(outcome) => outcome,
+            };
+        }
+
         run(
             "iptables",
             &[
@@ -397,12 +476,51 @@ impl ResponseExecutor {
             return Outcome::fail("не указан PID процесса");
         }
 
-        if command.param_pid == 1 {
+        // PID 1 защищаем только на Unix: там это init, завершение
+        // которого обрушило бы систему. В Windows PID 1 — обычный
+        // процесс (часто «System Idle Process»), и такой защиты
+        // не требуется.
+        if !cfg!(windows) && command.param_pid == 1 {
             return Outcome::fail("завершение процесса с PID 1 (init) запрещено");
         }
 
         if command.param_pid == std::process::id() {
             return Outcome::fail("агент отказывается завершать сам себя");
+        }
+
+        if cfg!(windows) {
+            // PID 4 — системный процесс ядра Windows («System»).
+            // Его завершение невозможно и привело бы к отказу системы,
+            // поэтому команда отклоняется до обращения к системе.
+            if command.param_pid == 4 {
+                return Outcome::fail(
+                    "завершение системного процесса Windows (PID 4) запрещено",
+                );
+            }
+
+            // Сначала проверяем, что процесс существует. На Linux это
+            // делает проверка /proc: без неё `kill` вернул бы невнятную
+            // ошибку. В Windows ту же роль играет tasklist — иначе
+            // оператор получил бы сообщение об отказе, не понимая,
+            // в чём причина: в самом процессе или в правах.
+            let code_page = *self
+                .code_page
+                .get_or_init(crate::sysops::console_code_page);
+
+            let query = sysops::execute(&wincmd::process_query(command.param_pid), code_page);
+            if query.success && !query.output.contains(&command.param_pid.to_string()) {
+                return Outcome::fail(format!(
+                    "процесс с PID {} не найден",
+                    command.param_pid
+                ));
+            }
+
+            return match self.run_windows(&wincmd::kill_process(command.param_pid)) {
+                Ok(()) => Outcome::ok(format!("Процесс {} завершён", command.param_pid))
+                    .with("pid", command.param_pid.to_string())
+                    .with("mechanism", "taskkill /F"),
+                Err(outcome) => outcome,
+            };
         }
 
         // Сначала проверяем, что процесс существует: иначе SIGTERM
@@ -456,6 +574,26 @@ impl ResponseExecutor {
             return Outcome::fail("блокировка учётной записи root запрещена");
         }
 
+        if cfg!(windows) {
+            // Встроенную учётную запись администратора защищаем отдельно:
+            // её отключение может лишить доступа к узлу. Windows
+            // дополнительно отклонит отключение ПОСЛЕДНЕГО администратора
+            // (ошибка 1322), но полагаться только на это не стоит.
+            let lowered = user.to_ascii_lowercase();
+            if lowered == "administrator" || lowered == "администратор" {
+                return Outcome::fail(
+                    "отключение встроенной учётной записи администратора запрещено",
+                );
+            }
+
+            return match self.run_windows(&wincmd::set_user_enabled(&user, false)) {
+                Ok(()) => Outcome::ok(format!("Учётная запись {user} отключена"))
+                    .with("user", user.clone())
+                    .with("mechanism", "net user /active:no"),
+                Err(outcome) => outcome,
+            };
+        }
+
         match run("usermod", &["--lock", &user]) {
             result if result.success => {
                 Outcome::ok(format!("Учётная запись {user} заблокирована"))
@@ -475,6 +613,15 @@ impl ResponseExecutor {
             Ok(user) => user,
             Err(err) => return Outcome::fail(err),
         };
+
+        if cfg!(windows) {
+            return match self.run_windows(&wincmd::set_user_enabled(&user, true)) {
+                Ok(()) => Outcome::ok(format!("Учётная запись {user} включена"))
+                    .with("user", user.clone())
+                    .with("mechanism", "net user /active:yes"),
+                Err(outcome) => outcome,
+            };
+        }
 
         match run("usermod", &["--unlock", &user]) {
             result if result.success => {
@@ -499,6 +646,10 @@ impl ResponseExecutor {
     /// срез состояния для разбора инцидента.
     fn collect_forensics(&self, command: &ResponseCommand) -> Outcome {
         let mut outcome = Outcome::ok("Собрана информация об узле");
+
+        if cfg!(windows) {
+            return self.collect_forensics_windows(command, outcome);
+        }
 
         // Список процессов на момент разбора.
         if let Ok(output) = Command::new("ps").args(["aux"]).output() {
@@ -536,6 +687,118 @@ impl ResponseExecutor {
         outcome
     }
 
+    /// Сбор информации об узле на Windows.
+    ///
+    /// Состав сведений тот же, что и на Linux: процессы, сетевые
+    /// соединения и сведения о системе. Для разбора инцидента этого
+    /// достаточно, а сами данные безопасны — ничего не изменяется.
+    fn collect_forensics_windows(
+        &self,
+        command: &ResponseCommand,
+        mut outcome: Outcome,
+    ) -> Outcome {
+        let code_page = *self
+            .code_page
+            .get_or_init(crate::sysops::console_code_page);
+
+        // Список процессов.
+        let processes = sysops::execute(&wincmd::list_processes(), code_page);
+        if processes.success {
+            let count = processes.output.lines().filter(|l| !l.is_empty()).count();
+            outcome = outcome.with("processes_total", count.to_string());
+
+            // В отчёт кладём только «хвост»: полный список раздул бы
+            // сообщение и не поместился бы в пределы передачи.
+            let sample: String = processes
+                .output
+                .lines()
+                .take(20)
+                .collect::<Vec<_>>()
+                .join("
+");
+            outcome = outcome.with("processes_sample", sample);
+        } else {
+            outcome = outcome.with("processes_error", processes.output);
+        }
+
+        // Установленные сетевые соединения: важны для разбора вторжений.
+        let connections = sysops::execute(&wincmd::list_connections(), code_page);
+        if connections.success {
+            let sample: String = connections
+                .output
+                .lines()
+                .take(20)
+                .collect::<Vec<_>>()
+                .join("
+");
+            outcome = outcome.with("connections_sample", sample);
+        } else {
+            outcome = outcome.with("connections_error", connections.output);
+        }
+
+        // Сведения о системе: версия, владелец, время загрузки.
+        let system = sysops::execute(&wincmd::system_info(), code_page);
+        if system.success {
+            let sample: String = system.output.lines().take(20).collect::<Vec<_>>().join("
+");
+            outcome = outcome.with("system_sample", sample);
+        }
+
+        // Состояние учётной записи, отключённой предыдущим реагированием:
+        // при разборе инцидента важно знать, действительно ли она
+        // отключена, а не полагаться на запись в журнале Core.
+        if let Some(user) = command
+            .param_extra
+            .iter()
+            .find_map(|p| p.strip_prefix("user="))
+        {
+            let state = sysops::execute(&wincmd::query_user(user), code_page);
+            outcome = outcome.with(
+                "user_state",
+                if state.success { "запрос выполнен" } else { "нет данных" },
+            );
+            let sample: String = state.output.lines().take(15).collect::<Vec<_>>().join("\n");
+            outcome = outcome.with("user_sample", sample);
+        }
+
+        // Последние входы в систему берутся из журнала событий: на Windows
+        // аналога команды `last` нет, а код 4624 как раз фиксирует входы.
+        let logins = sysops::execute(
+            &wincmd::CommandSpec {
+                program: "wevtutil".to_string(),
+                args: vec![
+                    "qe".to_string(),
+                    "Security".to_string(),
+                    "/q:*[System[(EventID=4624)]]".to_string(),
+                    "/c:10".to_string(),
+                    "/rd:true".to_string(),
+                    "/f:text".to_string(),
+                ],
+            },
+            code_page,
+        );
+        if logins.success {
+            let sample: String = logins.output.lines().take(40).collect::<Vec<_>>().join("
+");
+            outcome = outcome.with("last_logins", sample);
+        } else {
+            // Отсутствие прав на канал Security — ожидаемая ситуация,
+            // и оператору нужно объяснить причину, а не молчать.
+            outcome = outcome.with("last_logins_error", logins.output);
+        }
+
+        outcome = outcome.with(
+            "requested_by",
+            if command.issued_by.is_empty() {
+                "operator".to_string()
+            } else {
+                command.issued_by.clone()
+            },
+        );
+
+        outcome
+    }
+
     /// Помещение файла в карантин.
     ///
     /// Файл НЕ удаляется: он перемещается в карантинный каталог с
@@ -559,10 +822,24 @@ impl ResponseExecutor {
         }
 
         // Запрещаем карантин системных каталогов: ошибка оператора
-        // не должна ломать узел.
-        const FORBIDDEN: [&str; 6] = ["/proc", "/sys", "/dev", "/boot", "/usr/lib", "/lib"];
-        if FORBIDDEN.iter().any(|f| path.starts_with(f)) {
-            return Outcome::fail(format!("карантин системного пути {path} запрещён"));
+        // не должна ломать узел. Набор запрещённых путей зависит
+        // от платформы: на Windows это системные каталоги Windows.
+        if cfg!(windows) {
+            if let Some(reason) = wincmd::forbidden_quarantine_reason(&path) {
+                return Outcome::fail(reason);
+            }
+
+            if !wincmd::is_absolute_windows_path(&path) {
+                return Outcome::fail(format!(
+                    "путь {path} не является абсолютным путём Windows"
+                ));
+            }
+        } else {
+            const FORBIDDEN: [&str; 6] =
+                ["/proc", "/sys", "/dev", "/boot", "/usr/lib", "/lib"];
+            if FORBIDDEN.iter().any(|f| path.starts_with(f)) {
+                return Outcome::fail(format!("карантин системного пути {path} запрещён"));
+            }
         }
 
         let source = std::path::Path::new(&path);
@@ -570,7 +847,13 @@ impl ResponseExecutor {
             return Outcome::fail(format!("файл {path} не найден"));
         }
 
-        let quarantine_dir = std::path::Path::new("/var/lib/alyvion/quarantine");
+        // Каталог карантина выбирается по платформе: на Windows это
+        // ProgramData, где службы хранят свои данные.
+        let quarantine_dir = if cfg!(windows) {
+            std::path::Path::new(wincmd::QUARANTINE_DIR)
+        } else {
+            std::path::Path::new("/var/lib/alyvion/quarantine")
+        };
         if let Err(err) = std::fs::create_dir_all(quarantine_dir) {
             return Outcome::fail(format!("не удалось создать карантинный каталог: {err}"));
         }
