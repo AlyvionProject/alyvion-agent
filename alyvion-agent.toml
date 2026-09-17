@@ -53,7 +53,7 @@ auditd = true
 # Источники событий Windows. На Linux эти значения не действуют:
 # журнала событий Windows там нет, и сборщик ничего не возвращает.
 # Журнал событий Windows: Security, System, Application, PowerShell.
-winevent = false
+winevent = true
 # Канал Sysmon. Требует отдельной установки Sysmon на узле: если его
 # нет, опрос канала даёт ошибку «канал не найден» на каждом цикле.
 sysmon = false
