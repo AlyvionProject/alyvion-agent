@@ -6,7 +6,7 @@
 # Идентификатор узла. Пусто — берётся имя хоста.
 agent_id = ""
 
-core_url = "http://127.0.0.1:5050"
+core_url = "https://127.0.0.1:5050"
 
 telemetry_interval_secs = 10
 heartbeat_interval_secs = 15

@@ -41,7 +41,7 @@ use std::time::Duration;
 use anyhow::Context;
 use tokio::sync::{mpsc, watch};
 use tokio_stream::wrappers::ReceiverStream;
-use tonic::transport::{Channel, Endpoint};
+use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
 use tonic::Request;
 
 use config::AgentConfig;
@@ -56,8 +56,8 @@ pub mod pb {
 
 use pb::alyvion_core_client::AlyvionCoreClient;
 use pb::{
-    AgentHello, AgentHeartbeat, AgentMessage, CoreMessage, SecurityEventBatch, agent_message,
-    core_message,
+    AgentHello, AgentHeartbeat, AgentMessage, CoreMessage, EnrollRequest, SecurityEventBatch,
+    agent_message, core_message,
 };
 
 /// Версия агента — уходит в Core и отображается в консоли.
@@ -166,6 +166,9 @@ async fn wait_period(
 async fn main() -> anyhow::Result<()> {
     // Разбор аргументов командной строки: --config <путь>, --help.
     let mut config_path = None;
+    let mut enroll_token = None;
+    let mut ca_file = None;
+    let mut core_url = None;
     let mut args = std::env::args().skip(1);
 
     while let Some(arg) = args.next() {
@@ -175,6 +178,24 @@ async fn main() -> anyhow::Result<()> {
                     args.next()
                         .context("после --config требуется путь к файлу")?
                         .into(),
+                );
+            }
+            "--token" => {
+                enroll_token = Some(
+                    args.next()
+                        .context("после --token требуется значение")?,
+                );
+            }
+            "--ca" => {
+                ca_file = Some(
+                    args.next()
+                        .context("после --ca требуется путь к alyvion-ca.pem")?,
+                );
+            }
+            "--core" => {
+                core_url = Some(
+                    args.next()
+                        .context("после --core требуется адрес Core")?,
                 );
             }
             "--help" | "-h" => {
@@ -189,7 +210,17 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    let config = AgentConfig::load(config_path)?;
+    let mut config = AgentConfig::load(config_path)?;
+    if let Some(token) = enroll_token {
+        config.enrollment_token = token;
+    }
+    if let Some(path) = ca_file {
+        config.ca_file = path;
+    }
+    if let Some(url) = core_url {
+        config.core_url = url;
+    }
+    config.normalize()?;
 
     init_tracing();
 
@@ -207,7 +238,7 @@ async fn main() -> anyhow::Result<()> {
     let mut attempt: u32 = 0;
 
     loop {
-        match run_session(&config).await {
+        match run_session(&mut config).await {
             Ok(()) => {
                 tracing::info!("сессия завершена штатно");
                 attempt = 0;
@@ -235,19 +266,148 @@ async fn main() -> anyhow::Result<()> {
     }
 }
 
-/// Одна сессия связи с Core: от подключения до разрыва.
-async fn run_session(config: &AgentConfig) -> anyhow::Result<()> {
-    let endpoint = Endpoint::from_shared(config.core_url.clone())
+async fn connect_channel(config: &AgentConfig, with_client_cert: bool) -> anyhow::Result<Channel> {
+    let mut endpoint = Endpoint::from_shared(config.core_url.clone())
         .context("некорректный адрес Core")?
         .connect_timeout(Duration::from_secs(10))
-        // Долгий таймаут запроса: поток живёт постоянно, а не запрос-ответ.
         .timeout(Duration::from_secs(3600))
         .tcp_keepalive(Some(Duration::from_secs(30)))
         .http2_keep_alive_interval(Duration::from_secs(30))
         .keep_alive_timeout(Duration::from_secs(20))
         .keep_alive_while_idle(true);
 
-    let channel: Channel = endpoint.connect().await.context("Core недоступен")?;
+    if config.core_url.starts_with("https://") {
+        let ca_path = config.ca_path();
+        anyhow::ensure!(
+            ca_path.is_file(),
+            "нет файла УЦ {} — скачайте alyvion-ca.pem из панели и укажите --ca",
+            ca_path.display()
+        );
+        let bundle = std::fs::read_to_string(&ca_path)?;
+        let parsed = parse_trust_bundle(&bundle);
+        anyhow::ensure!(
+            !parsed.ca_pem.is_empty(),
+            "в {} нет сертификата УЦ",
+            ca_path.display()
+        );
+        let ca = Certificate::from_pem(&parsed.ca_pem);
+        let mut tls = ClientTlsConfig::new()
+            .domain_name(config.tls_domain())
+            .ca_certificate(ca);
+        if with_client_cert {
+            anyhow::ensure!(
+                config.has_client_identity(),
+                "нет клиентского сертификата — запустите агент с --token из панели"
+            );
+            tls = tls.identity(Identity::from_pem(
+                std::fs::read(config.client_cert_path())?,
+                std::fs::read(config.client_key_path())?,
+            ));
+        } else if let (Some(cert), Some(key)) = (parsed.enroll_cert, parsed.enroll_key) {
+            tls = tls.identity(Identity::from_pem(cert, key));
+        } else {
+            anyhow::bail!(
+                "в {} нет служебного сертификата зачисления — скачайте alyvion-ca.pem из панели",
+                ca_path.display()
+            );
+        }
+        endpoint = endpoint.tls_config(tls).context("настройка TLS")?;
+    }
+
+    endpoint
+        .connect()
+        .await
+        .map_err(|err| anyhow::anyhow!("Core недоступен: {err:#}"))
+}
+
+struct TrustBundle {
+    ca_pem: String,
+    enroll_cert: Option<String>,
+    enroll_key: Option<String>,
+}
+
+fn parse_trust_bundle(text: &str) -> TrustBundle {
+    let mut certs = Vec::new();
+    let mut keys = Vec::new();
+    let mut current: Option<String> = None;
+    let mut buf = String::new();
+    for line in text.lines() {
+        if line.starts_with("-----BEGIN ") {
+            current = Some(line.to_string());
+            buf = String::new();
+            buf.push_str(line);
+            buf.push('\n');
+        } else if line.starts_with("-----END ") {
+            buf.push_str(line);
+            buf.push('\n');
+            if let Some(header) = current.take() {
+                if header.contains("CERTIFICATE") {
+                    certs.push(buf.clone());
+                } else if header.contains("PRIVATE KEY") {
+                    keys.push(buf.clone());
+                }
+            }
+        } else if current.is_some() {
+            buf.push_str(line);
+            buf.push('\n');
+        }
+    }
+    let ca_pem = certs.first().cloned().unwrap_or_default();
+    TrustBundle {
+        ca_pem,
+        enroll_cert: certs.get(1).cloned(),
+        enroll_key: keys.first().cloned(),
+    }
+}
+
+async fn enroll_with_token(config: &mut AgentConfig) -> anyhow::Result<()> {
+    tracing::info!("зачисление по токену");
+    let channel = connect_channel(config, false).await?;
+    let mut client = AlyvionCoreClient::new(channel);
+    let response = client
+        .enroll(EnrollRequest {
+            token: config.enrollment_token.clone(),
+            hostname: config::hostname(),
+            agent_version: AGENT_VERSION.to_string(),
+        })
+        .await
+        .context("вызов Enroll")?
+        .into_inner();
+
+    anyhow::ensure!(
+        response.accepted,
+        "зачисление отклонено: {}",
+        response.message
+    );
+
+    std::fs::create_dir_all(config.identity_dir())?;
+    if !response.ca_cert_pem.is_empty() {
+        std::fs::write(config.identity_dir().join("ca.pem"), &response.ca_cert_pem)?;
+    }
+    std::fs::write(config.client_cert_path(), &response.client_cert_pem)?;
+    std::fs::write(config.client_key_path(), &response.client_key_pem)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(config.client_key_path())?.permissions();
+        perms.set_mode(0o600);
+        std::fs::set_permissions(config.client_key_path(), perms)?;
+    }
+    if !response.agent_id.is_empty() {
+        config.agent_id = response.agent_id;
+    }
+    tracing::info!(agent_id = %config.agent_id, "клиентский сертификат получен");
+    Ok(())
+}
+
+/// Одна сессия связи с Core: от подключения до разрыва.
+async fn run_session(config: &mut AgentConfig) -> anyhow::Result<()> {
+    if !config.enrollment_token.is_empty() {
+        enroll_with_token(config).await?;
+        config.enrollment_token.clear();
+    }
+
+    let channel = connect_channel(config, true).await?;
     let mut client = AlyvionCoreClient::new(channel);
 
     tracing::info!(core_url = %config.core_url, "соединение с Core установлено");
@@ -669,15 +829,21 @@ fn print_help() {
         r#"Агент Alyvion {AGENT_VERSION}
 
 Использование:
-    alyvion-agent [--config <файл>]
+    alyvion-agent [--config <файл>] [--token <токен>] [--ca <alyvion-ca.pem>] [--core <url>]
 
 Параметры:
     -c, --config <файл>   путь к файлу конфигурации TOML
+        --token <токен>   одноразовый токен зачисления из панели
+        --ca <файл>       корень УЦ Core (alyvion-ca.pem)
+        --core <url>      адрес Core, например https://192.168.1.10:5050
     -h, --help            показать эту справку
     -V, --version         показать версию
 
 Переменные окружения (переопределяют файл конфигурации):
     ALYVION_CORE_URL          адрес gRPC-сервера Core
+    ALYVION_ENROLL_TOKEN      токен зачисления
+    ALYVION_CA_FILE           путь к alyvion-ca.pem
+    ALYVION_TLS_NAME          имя сервера в сертификате Core
     ALYVION_AGENT_ID          идентификатор узла
     ALYVION_TELEMETRY_INTERVAL интервал телеметрии, секунды
     ALYVION_HEARTBEAT_INTERVAL интервал heartbeat, секунды

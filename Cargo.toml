@@ -6,7 +6,7 @@ description = "Агент Alyvion — сбор телеметрии и собы�
 
 [dependencies]
 # Транспорт до Core: gRPC поверх HTTP/2, один двунаправленный поток.
-tonic = "0.12"
+tonic = { version = "0.12", features = ["tls"] }
 prost = "0.13"
 tokio = { version = "1", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["sync"] }

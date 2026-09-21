@@ -24,8 +24,17 @@ pub struct AgentConfig {
     /// Должен быть стабильным: Core связывает с ним всю историю.
     pub agent_id: String,
 
-    /// Адрес gRPC-сервера Core, например `http://127.0.0.1:5050`.
+    /// Адрес gRPC-сервера Core, например `https://127.0.0.1:5050`.
     pub core_url: String,
+
+    /// Одноразовый токен зачисления из панели оператора.
+    pub enrollment_token: String,
+
+    /// Корень УЦ Core (alyvion-ca.pem). Пусто — файл в state_dir/mtls.
+    pub ca_file: String,
+
+    /// Имя сервера для проверки TLS (SAN). Пусто — взять хост из URL.
+    pub tls_server_name: String,
 
     /// Интервал отправки телеметрии, секунды.
     pub telemetry_interval_secs: u64,
@@ -136,7 +145,10 @@ impl Default for AgentConfig {
     fn default() -> Self {
         Self {
             agent_id: String::new(),
-            core_url: "http://127.0.0.1:5050".to_string(),
+            core_url: "https://127.0.0.1:5050".to_string(),
+            enrollment_token: String::new(),
+            ca_file: String::new(),
+            tls_server_name: String::new(),
             telemetry_interval_secs: 10,
             heartbeat_interval_secs: 15,
             events_interval_secs: 10,
@@ -187,6 +199,15 @@ impl AgentConfig {
         if let Ok(v) = std::env::var("ALYVION_CORE_URL") {
             self.core_url = v;
         }
+        if let Ok(v) = std::env::var("ALYVION_ENROLL_TOKEN") {
+            self.enrollment_token = v;
+        }
+        if let Ok(v) = std::env::var("ALYVION_CA_FILE") {
+            self.ca_file = v;
+        }
+        if let Ok(v) = std::env::var("ALYVION_TLS_NAME") {
+            self.tls_server_name = v;
+        }
         if let Ok(v) = std::env::var("ALYVION_AGENT_ID") {
             self.agent_id = v;
         }
@@ -211,7 +232,7 @@ impl AgentConfig {
     }
 
     /// Приводит конфигурацию к рабочему виду и проверяет её.
-    fn normalize(&mut self) -> anyhow::Result<()> {
+    pub fn normalize(&mut self) -> anyhow::Result<()> {
         if self.agent_id.trim().is_empty() {
             self.agent_id = hostname();
         }
@@ -232,6 +253,44 @@ impl AgentConfig {
         }
 
         Ok(())
+    }
+
+    pub fn identity_dir(&self) -> PathBuf {
+        self.state_dir.join("mtls")
+    }
+
+    pub fn ca_path(&self) -> PathBuf {
+        if self.ca_file.trim().is_empty() {
+            self.identity_dir().join("ca.pem")
+        } else {
+            PathBuf::from(&self.ca_file)
+        }
+    }
+
+    pub fn client_cert_path(&self) -> PathBuf {
+        self.identity_dir().join("client.crt")
+    }
+
+    pub fn client_key_path(&self) -> PathBuf {
+        self.identity_dir().join("client.key")
+    }
+
+    pub fn has_client_identity(&self) -> bool {
+        self.client_cert_path().is_file() && self.client_key_path().is_file()
+    }
+
+    pub fn tls_domain(&self) -> String {
+        if !self.tls_server_name.trim().is_empty() {
+            return self.tls_server_name.trim().to_string();
+        }
+        let host = host_from_url(&self.core_url);
+        if host.parse::<IpAddr>().is_ok() {
+            "localhost".to_string()
+        } else if host.is_empty() {
+            "alyvion-core".to_string()
+        } else {
+            host
+        }
     }
 
     pub fn events_interval(&self) -> Duration {
@@ -316,6 +375,24 @@ impl AgentConfig {
 fn default_config_path() -> Option<PathBuf> {
     let local = PathBuf::from("alyvion-agent.toml");
     local.exists().then_some(local)
+}
+
+fn host_from_url(url: &str) -> String {
+    let rest = url.split("://").nth(1).unwrap_or(url);
+    let hostport = rest.split('/').next().unwrap_or(rest);
+    let host = match hostport.rsplit_once('@') {
+        Some((_, h)) => h,
+        None => hostport,
+    };
+    host.split('%').next().unwrap_or(host)
+        .split(']')
+        .next()
+        .unwrap_or(host)
+        .trim_start_matches('[')
+        .split(':')
+        .next()
+        .unwrap_or(host)
+        .to_string()
 }
 
 fn env_u64(name: &str) -> Option<u64> {
