@@ -396,6 +396,7 @@ async fn enroll_with_token(config: &mut AgentConfig) -> anyhow::Result<()> {
     if !response.agent_id.is_empty() {
         config.agent_id = response.agent_id;
     }
+    config.persist_enrolled_id()?;
     tracing::info!(agent_id = %config.agent_id, "клиентский сертификат получен");
     Ok(())
 }

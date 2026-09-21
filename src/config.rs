@@ -234,6 +234,14 @@ impl AgentConfig {
     /// Приводит конфигурацию к рабочему виду и проверяет её.
     pub fn normalize(&mut self) -> anyhow::Result<()> {
         if self.agent_id.trim().is_empty() {
+            if let Ok(stored) = std::fs::read_to_string(self.agent_id_path()) {
+                let stored = stored.trim();
+                if !stored.is_empty() {
+                    self.agent_id = stored.to_string();
+                }
+            }
+        }
+        if self.agent_id.trim().is_empty() {
             self.agent_id = hostname();
         }
 
@@ -277,6 +285,21 @@ impl AgentConfig {
 
     pub fn has_client_identity(&self) -> bool {
         self.client_cert_path().is_file() && self.client_key_path().is_file()
+    }
+
+    pub fn agent_id_path(&self) -> PathBuf {
+        self.identity_dir().join("agent_id")
+    }
+
+    /// Запоминает id, выданный при зачислении, чтобы после перезапуска
+    /// Hello совпадал с CN сертификата, а не с именем хоста.
+    pub fn persist_enrolled_id(&self) -> anyhow::Result<()> {
+        if self.agent_id.trim().is_empty() {
+            return Ok(());
+        }
+        std::fs::create_dir_all(self.identity_dir())?;
+        std::fs::write(self.agent_id_path(), self.agent_id.trim())?;
+        Ok(())
     }
 
     pub fn tls_domain(&self) -> String {
